@@ -5,9 +5,13 @@
 
 package org.lineageos.glimpse.ui.recyclerview
 
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.annotation.OptIn
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
@@ -33,6 +37,7 @@ import org.lineageos.glimpse.viewmodels.LocalPlayerViewModel
 class MediaViewerAdapter(
     private val localPlayerViewModel: LocalPlayerViewModel,
     private val onNavigate: (forward: Boolean) -> Unit,
+    private val onZoomGrabbed: (grabbed: Boolean) -> Unit,
 ) : ListAdapter<Media, MediaViewerAdapter.MediaViewHolder>(UniqueItemDiffCallback()) {
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = MediaViewHolder(
         LayoutInflater.from(parent.context).inflate(R.layout.media_view, parent, false),
@@ -66,6 +71,12 @@ class MediaViewerAdapter(
         private var media: Media? = null
         private var motionPhoto: MotionPhoto? = null
         private var isCurrentlyDisplayedView = false
+        private val zoomGrabCallback = object : OnBackPressedCallback(false) {
+            override fun handleOnBackPressed() {
+                setZoomGrabbed(false)
+            }
+        }
+        private val releaseZoom = Runnable { setZoomGrabbed(false) }
         private val mediaGestureListener = MediaGestureListener(
             context = itemView.context,
             onNavigate = onNavigate,
@@ -77,6 +88,11 @@ class MediaViewerAdapter(
 
             val isVideo = media?.mediaType == MediaType.VIDEO || motionPhoto != null
             val isNowVideoPlayer = isCurrentlyDisplayedView && isVideo
+
+            imageView.isFocusable = isCurrentlyDisplayedView && !isVideo
+            if (!imageView.isFocusable) {
+                setZoomGrabbed(false)
+            }
 
             imageView.isVisible = !isNowVideoPlayer
             playerView.isVisible = isNowVideoPlayer
@@ -133,6 +149,48 @@ class MediaViewerAdapter(
         private var observersJob: Job? = null
 
         init {
+            imageView.setOnKeyListener { _, keyCode, event ->
+                if (!isCurrentlyDisplayedView || media?.mediaType != MediaType.IMAGE ||
+                    motionPhoto != null
+                ) {
+                    return@setOnKeyListener false
+                }
+
+                when (keyCode) {
+                    KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> {
+                        if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                            setZoomGrabbed(!zoomGrabCallback.isEnabled)
+                        }
+                        true
+                    }
+
+                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        if (!zoomGrabCallback.isEnabled) {
+                            return@setOnKeyListener false
+                        }
+
+                        if (event.action == KeyEvent.ACTION_DOWN) {
+                            resetZoomTimeout()
+                            itemView.findViewTreeLifecycleOwner()?.lifecycleScope?.launch {
+                                imageView.zoomable.scaleBy(
+                                    when (keyCode) {
+                                        KeyEvent.KEYCODE_DPAD_UP -> 1.25f
+                                        else -> 1f / 1.25f
+                                    }
+                                )
+                            }
+                        }
+                        true
+                    }
+
+                    else -> false
+                }
+            }
+            imageView.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    setZoomGrabbed(false)
+                }
+            }
             imageView.setOnClickListener {
                 localPlayerViewModel.toggleFullscreenMode()
             }
@@ -145,10 +203,34 @@ class MediaViewerAdapter(
             playerView.setOnTouchListener(mediaGestureListener)
         }
 
+        private fun setZoomGrabbed(grabbed: Boolean) {
+            if (zoomGrabCallback.isEnabled == grabbed) {
+                return
+            }
+
+            zoomGrabCallback.isEnabled = grabbed
+            imageView.removeCallbacks(releaseZoom)
+            mediaGestureListener.edgeTapNavigationEnabled =
+                !grabbed && localPlayerViewModel.edgeTapNavigationEnabled
+            onZoomGrabbed(grabbed)
+
+            if (grabbed) {
+                resetZoomTimeout()
+                Toast.makeText(
+                    itemView.context, R.string.media_zoom_grab_toast, Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+
+        private fun resetZoomTimeout() {
+            imageView.removeCallbacks(releaseZoom)
+            imageView.postDelayed(releaseZoom, 4000)
+        }
+
         @OptIn(androidx.media3.common.util.UnstableApi::class)
         private fun updateMediaGestureListener(isVideoPlayer: Boolean) {
             mediaGestureListener.edgeTapNavigationEnabled =
-                localPlayerViewModel.edgeTapNavigationEnabled
+                !zoomGrabCallback.isEnabled && localPlayerViewModel.edgeTapNavigationEnabled
 
             mediaGestureListener.doubleTapSeekEnabled =
                 isVideoPlayer && localPlayerViewModel.doubleTapToSeekEnabled
@@ -172,12 +254,20 @@ class MediaViewerAdapter(
         }
 
         fun bind(media: Media) {
+            setZoomGrabbed(false)
             this.media = media
 
+            imageView.isFocusable = localPlayerViewModel.mediaPosition.value == bindingAdapterPosition
+                    && media.mediaType == MediaType.IMAGE && motionPhoto == null
             imageView.load(media.uri)
         }
 
         fun onViewAttachedToWindow() {
+            itemView.findViewTreeLifecycleOwner()?.let { lifecycleOwner ->
+                itemView.findViewTreeOnBackPressedDispatcherOwner()?.onBackPressedDispatcher
+                    ?.addCallback(lifecycleOwner, zoomGrabCallback)
+            }
+
             observersJob = itemView.findViewTreeLifecycleOwner()?.lifecycleScope?.launch {
                 launch {
                     localPlayerViewModel.mediaPosition.collectLatest(mediaPositionObserver)
@@ -198,6 +288,9 @@ class MediaViewerAdapter(
 
         @OptIn(androidx.media3.common.util.UnstableApi::class)
         fun onViewDetachedFromWindow() {
+            setZoomGrabbed(false)
+            zoomGrabCallback.remove()
+
             observersJob?.cancel()
             observersJob = null
 
