@@ -13,6 +13,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.view.KeyEvent
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.Toast
@@ -105,6 +106,9 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
                         viewPager.setCurrentItem(newPosition, true)
                     }
                 }
+            },
+            onZoomGrabbed = { grabbed ->
+                viewPager.isUserInputEnabled = !grabbed
             },
         )
     }
@@ -315,6 +319,39 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
                 }
             }
         }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val direction = when (event.keyCode) {
+            KeyEvent.KEYCODE_DPAD_UP -> View.FOCUS_UP
+            KeyEvent.KEYCODE_DPAD_DOWN -> View.FOCUS_DOWN
+            else -> return super.dispatchKeyEvent(event)
+        }
+
+        if (event.action == KeyEvent.ACTION_DOWN && viewPager.isUserInputEnabled) {
+            val imageView = viewPager.getFocusables(direction).firstOrNull {
+                it.id == R.id.imageView
+            }
+
+            // The photo fills the pager behind both sheets, so connect their focus explicitly.
+            val target = when {
+                imageView == null -> null
+                imageView.hasFocus() -> when (direction) {
+                    View.FOCUS_UP -> appBarLayout
+                    else -> bottomSheetLinearLayout
+                }
+
+                direction == View.FOCUS_DOWN && appBarLayout.hasFocus() -> imageView
+                direction == View.FOCUS_UP && bottomSheetLinearLayout.hasFocus() -> imageView
+                else -> null
+            }
+
+            if (target?.requestFocus(direction) == true) {
+                return true
+            }
+        }
+
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onResume() {
