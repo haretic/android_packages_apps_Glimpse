@@ -5,13 +5,11 @@
 
 package org.lineageos.glimpse.ui.recyclerview
 
+import android.view.Choreographer
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.Toast
-import androidx.activity.OnBackPressedCallback
-import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.annotation.OptIn
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
@@ -22,9 +20,11 @@ import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.github.panpf.zoomimage.GlideZoomImageView
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlin.math.exp
 import org.lineageos.glimpse.R
 import org.lineageos.glimpse.ext.fade
 import org.lineageos.glimpse.ext.load
@@ -37,7 +37,6 @@ import org.lineageos.glimpse.viewmodels.LocalPlayerViewModel
 class MediaViewerAdapter(
     private val localPlayerViewModel: LocalPlayerViewModel,
     private val onNavigate: (forward: Boolean) -> Unit,
-    private val onZoomGrabbed: (grabbed: Boolean) -> Unit,
 ) : ListAdapter<Media, MediaViewerAdapter.MediaViewHolder>(UniqueItemDiffCallback()) {
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) = MediaViewHolder(
         LayoutInflater.from(parent.context).inflate(R.layout.media_view, parent, false),
@@ -71,12 +70,11 @@ class MediaViewerAdapter(
         private var media: Media? = null
         private var motionPhoto: MotionPhoto? = null
         private var isCurrentlyDisplayedView = false
-        private val zoomGrabCallback = object : OnBackPressedCallback(false) {
-            override fun handleOnBackPressed() {
-                setZoomGrabbed(false)
-            }
-        }
-        private val releaseZoom = Runnable { setZoomGrabbed(false) }
+        // The wheel zooms the photo: every step moves a target scale and each frame eases the
+        // photo a share of the way there, so turning glides rather than jumps. 0: no target.
+        private var zoomTarget = 0f
+        private var zoomFrameNanos = 0L
+        private val zoomFrame = Choreographer.FrameCallback { frameNanos -> zoomStep(frameNanos) }
         private val mediaGestureListener = MediaGestureListener(
             context = itemView.context,
             onNavigate = onNavigate,
@@ -91,7 +89,7 @@ class MediaViewerAdapter(
 
             imageView.isFocusable = isCurrentlyDisplayedView && !isVideo
             if (!imageView.isFocusable) {
-                setZoomGrabbed(false)
+                stopWheelZoom()
             }
 
             imageView.isVisible = !isNowVideoPlayer
@@ -157,38 +155,23 @@ class MediaViewerAdapter(
                 }
 
                 when (keyCode) {
-                    KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_DPAD_CENTER -> {
-                        if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
-                            setZoomGrabbed(!zoomGrabCallback.isEnabled)
-                        }
-                        true
-                    }
-
-                    KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                        if (!zoomGrabCallback.isEnabled) {
-                            return@setOnKeyListener false
-                        }
-
+                    KeyEvent.KEYCODE_DPAD_UP -> {
                         if (event.action == KeyEvent.ACTION_DOWN) {
-                            resetZoomTimeout()
-                            itemView.findViewTreeLifecycleOwner()?.lifecycleScope?.launch {
-                                imageView.zoomable.scaleBy(
-                                    when (keyCode) {
-                                        KeyEvent.KEYCODE_DPAD_UP -> 1.25f
-                                        else -> 1f / 1.25f
-                                    }
-                                )
-                            }
+                            wheelZoom(zoomIn = true)
                         }
                         true
                     }
+
+                    // Fully zoomed out, the wheel goes on to the actions below the photo
+                    KeyEvent.KEYCODE_DPAD_DOWN -> event.action != KeyEvent.ACTION_DOWN ||
+                            wheelZoom(zoomIn = false)
 
                     else -> false
                 }
             }
             imageView.setOnFocusChangeListener { _, hasFocus ->
                 if (!hasFocus) {
-                    setZoomGrabbed(false)
+                    stopWheelZoom()
                 }
             }
             imageView.setOnClickListener {
@@ -203,34 +186,65 @@ class MediaViewerAdapter(
             playerView.setOnTouchListener(mediaGestureListener)
         }
 
-        private fun setZoomGrabbed(grabbed: Boolean) {
-            if (zoomGrabCallback.isEnabled == grabbed) {
+        /** One wheel step; false when there's no further to zoom out. */
+        private fun wheelZoom(zoomIn: Boolean): Boolean {
+            val zoomable = imageView.zoomable
+            val minScale = zoomable.minScaleState.value
+            val maxScale = zoomable.maxScaleState.value
+            val from = if (zoomTarget > 0f) zoomTarget else zoomable.transformState.value.scaleX
+            if (!zoomIn && from <= minScale * 1.001f) {
+                return false
+            }
+
+            zoomTarget = (if (zoomIn) from * WHEEL_ZOOM_STEP else from / WHEEL_ZOOM_STEP)
+                .coerceIn(minScale, maxScale)
+            if (zoomFrameNanos == 0L) {
+                zoomFrameNanos = System.nanoTime()
+                Choreographer.getInstance().postFrameCallback(zoomFrame)
+            }
+            return true
+        }
+
+        private fun zoomStep(frameNanos: Long) {
+            val target = zoomTarget
+            if (target <= 0f) {
+                zoomFrameNanos = 0L
                 return
             }
 
-            zoomGrabCallback.isEnabled = grabbed
-            imageView.removeCallbacks(releaseZoom)
-            mediaGestureListener.edgeTapNavigationEnabled =
-                !grabbed && localPlayerViewModel.edgeTapNavigationEnabled
-            onZoomGrabbed(grabbed)
+            val zoomable = imageView.zoomable
+            val current = zoomable.transformState.value.scaleX
+            // Frame-rate independent easing: a fixed share of the way per unit of time
+            val seconds = (frameNanos - zoomFrameNanos).coerceIn(0L, 50_000_000L) / 1e9f
+            zoomFrameNanos = frameNanos
+            val eased = current + (target - current) * (1f - exp(-seconds / WHEEL_ZOOM_EASE_S))
+            val done = kotlin.math.abs(target - eased) <= target * 0.002f
+            val next = if (done) target else eased
 
-            if (grabbed) {
-                resetZoomTimeout()
-                Toast.makeText(
-                    itemView.context, R.string.media_zoom_grab_toast, Toast.LENGTH_SHORT
-                ).show()
+            itemView.findViewTreeLifecycleOwner()?.lifecycleScope?.launch(
+                start = CoroutineStart.UNDISPATCHED
+            ) {
+                zoomable.scale(next, animated = false)
+            }
+
+            if (done) {
+                zoomTarget = 0f
+                zoomFrameNanos = 0L
+            } else {
+                Choreographer.getInstance().postFrameCallback(zoomFrame)
             }
         }
 
-        private fun resetZoomTimeout() {
-            imageView.removeCallbacks(releaseZoom)
-            imageView.postDelayed(releaseZoom, 4000)
+        private fun stopWheelZoom() {
+            Choreographer.getInstance().removeFrameCallback(zoomFrame)
+            zoomTarget = 0f
+            zoomFrameNanos = 0L
         }
 
         @OptIn(androidx.media3.common.util.UnstableApi::class)
         private fun updateMediaGestureListener(isVideoPlayer: Boolean) {
             mediaGestureListener.edgeTapNavigationEnabled =
-                !zoomGrabCallback.isEnabled && localPlayerViewModel.edgeTapNavigationEnabled
+                localPlayerViewModel.edgeTapNavigationEnabled
 
             mediaGestureListener.doubleTapSeekEnabled =
                 isVideoPlayer && localPlayerViewModel.doubleTapToSeekEnabled
@@ -254,7 +268,7 @@ class MediaViewerAdapter(
         }
 
         fun bind(media: Media) {
-            setZoomGrabbed(false)
+            stopWheelZoom()
             this.media = media
 
             imageView.isFocusable = localPlayerViewModel.mediaPosition.value == bindingAdapterPosition
@@ -263,11 +277,6 @@ class MediaViewerAdapter(
         }
 
         fun onViewAttachedToWindow() {
-            itemView.findViewTreeLifecycleOwner()?.let { lifecycleOwner ->
-                itemView.findViewTreeOnBackPressedDispatcherOwner()?.onBackPressedDispatcher
-                    ?.addCallback(lifecycleOwner, zoomGrabCallback)
-            }
-
             observersJob = itemView.findViewTreeLifecycleOwner()?.lifecycleScope?.launch {
                 launch {
                     localPlayerViewModel.mediaPosition.collectLatest(mediaPositionObserver)
@@ -288,8 +297,7 @@ class MediaViewerAdapter(
 
         @OptIn(androidx.media3.common.util.UnstableApi::class)
         fun onViewDetachedFromWindow() {
-            setZoomGrabbed(false)
-            zoomGrabCallback.remove()
+            stopWheelZoom()
 
             observersJob?.cancel()
             observersJob = null
@@ -298,5 +306,13 @@ class MediaViewerAdapter(
             playerView.player = null
             playerControlView.player = null
         }
+    }
+
+    companion object {
+        /** How much one wheel step zooms */
+        private const val WHEEL_ZOOM_STEP = 1.08f
+
+        /** How quickly the photo follows the wheel: the time to cover 63% of the way */
+        private const val WHEEL_ZOOM_EASE_S = 0.06f
     }
 }

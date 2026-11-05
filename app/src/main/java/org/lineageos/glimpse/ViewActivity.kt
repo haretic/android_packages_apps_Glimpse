@@ -107,9 +107,6 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
                     }
                 }
             },
-            onZoomGrabbed = { grabbed ->
-                viewPager.isUserInputEnabled = !grabbed
-            },
         )
     }
 
@@ -328,21 +325,27 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
             else -> return super.dispatchKeyEvent(event)
         }
 
-        if (event.action == KeyEvent.ACTION_DOWN && viewPager.isUserInputEnabled) {
-            val imageView = viewPager.getFocusables(direction).firstOrNull {
-                it.id == R.id.imageView
-            }
+        val imageView = viewPager.getFocusables(direction).firstOrNull {
+            it.id == R.id.imageView
+        } ?: return super.dispatchKeyEvent(event)
 
-            // The photo fills the pager behind both sheets, so connect their focus explicitly.
+        // The wheel zooms the photo first; the photo passes it on once fully zoomed out.
+        // Beyond that the wheel goes round: photo, the actions below, the toolbar, the photo.
+        if ((imageView.hasFocus() || bottomSheetLinearLayout.hasFocus()) &&
+            super.dispatchKeyEvent(event)
+        ) {
+            return true
+        }
+
+        if (event.action == KeyEvent.ACTION_DOWN) {
             val target = when {
-                imageView == null -> null
-                imageView.hasFocus() -> when (direction) {
-                    View.FOCUS_UP -> appBarLayout
-                    else -> bottomSheetLinearLayout
+                imageView.hasFocus() && direction == View.FOCUS_DOWN -> bottomSheetLinearLayout
+                bottomSheetLinearLayout.hasFocus() -> when (direction) {
+                    View.FOCUS_UP -> imageView
+                    else -> appBarLayout
                 }
 
-                direction == View.FOCUS_DOWN && appBarLayout.hasFocus() -> imageView
-                direction == View.FOCUS_UP && bottomSheetLinearLayout.hasFocus() -> imageView
+                appBarLayout.hasFocus() && direction == View.FOCUS_DOWN -> imageView
                 else -> null
             }
 
@@ -351,7 +354,10 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
             }
         }
 
-        return super.dispatchKeyEvent(event)
+        return when {
+            imageView.hasFocus() || bottomSheetLinearLayout.hasFocus() -> false
+            else -> super.dispatchKeyEvent(event)
+        }
     }
 
     override fun onResume() {
