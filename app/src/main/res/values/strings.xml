@@ -8,7 +8,6 @@
 
     <!-- Toast messages -->
     <string name="app_permissions_toast">Permissions not granted by the user.</string>
-    <string name="media_zoom_grab_toast">Turn to zoom - press to let go</string>
 
     <!-- Titles -->
     <string name="reels_title">Reels</string>
