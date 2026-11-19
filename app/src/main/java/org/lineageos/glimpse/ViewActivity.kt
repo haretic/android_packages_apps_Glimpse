@@ -338,6 +338,24 @@ class ViewActivity : AppCompatActivity(R.layout.activity_view) {
         }
 
         if (event.action == KeyEvent.ACTION_DOWN) {
+            // Along the actions below the photo and the toolbar's buttons first, as text reads:
+            // down from Favourite is Share, Edit, Trash, not straight back up to the toolbar
+            listOf(bottomSheetLinearLayout, appBarLayout).firstOrNull { it.hasFocus() }
+                ?.let { group ->
+                    val focusables = ArrayList<View>()
+                    group.addFocusables(focusables, View.FOCUS_FORWARD)
+                    val shown = focusables.filter { it.isShown }
+                    val at = shown.indexOf(group.findFocus())
+                    val next = if (at < 0) {
+                        null
+                    } else {
+                        shown.getOrNull(if (direction == View.FOCUS_DOWN) at + 1 else at - 1)
+                    }
+                    if (next?.requestFocus(direction) == true) {
+                        return true
+                    }
+                }
+
             val target = when {
                 imageView.hasFocus() && direction == View.FOCUS_DOWN -> bottomSheetLinearLayout
                 bottomSheetLinearLayout.hasFocus() -> when (direction) {
