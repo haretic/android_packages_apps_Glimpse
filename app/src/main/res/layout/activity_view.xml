@@ -28,6 +28,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             app:menu="@menu/activity_view_toolbar"
+            app:navigationContentDescription="@string/abc_action_bar_up_description"
             app:navigationIcon="@drawable/ic_back"
             app:navigationIconTint="@android:color/white"
             app:subtitleTextAppearance="?attr/textAppearanceTitleSmall"
